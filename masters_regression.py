@@ -837,7 +837,16 @@ def run_model_iteration(
     feature_cols: list[str],
     label: str,
 ) -> tuple[RegressionResultsWrapper, list[str]]:
+    if not feature_cols:
+        raise ValueError("run_model_iteration: feature_cols is empty.")
     work = df.dropna(subset=["finish_rank"] + feature_cols).copy()
+    if len(work) == 0:
+        chk = ["finish_rank"] + feature_cols
+        na = df[[c for c in chk if c in df.columns]].isna().sum()
+        raise ValueError(
+            "No complete cases for OLS (n=0). Missing-count per column:\n"
+            f"{na.to_string()}"
+        )
     y = work["finish_rank"].to_numpy(dtype=float)
     X = sm.add_constant(work[feature_cols], has_constant="add")
 
@@ -847,6 +856,7 @@ def run_model_iteration(
         try:
             res = sm.OLS(y, X).fit(cov_type="cluster", cov_kwds={"groups": groups})
         except Exception:
+            # e.g. covariance failure when clusters are degenerate; fall back to classical SE
             res = sm.OLS(y, X).fit()
     else:
         res = sm.OLS(y, X).fit()
@@ -876,6 +886,30 @@ def impute_group_medians(df: pd.DataFrame, cols: list[str], group_col: str) -> N
         df[c] = df[c].astype(float)
         df[c] = df.groupby(group_col)[c].transform(lambda s: s.fillna(s.median()))
         df[c] = df[c].fillna(df[c].median())
+
+
+def fill_feature_columns_for_regression(
+    df: pd.DataFrame,
+    feature_cols: list[str],
+    group_col: str = "season_year",
+) -> None:
+    """
+    In-place: coerce to float, impute by group then global median so listwise-complete
+    regression uses the same n as nested comparisons that dropna on subsets of columns.
+
+    Forward selection fits tournament + a growing skill set; the final model uses all
+    selected skills at once — without this pass, disjoint NaNs across skills can leave
+    zero complete cases.
+    """
+    for c in feature_cols:
+        if c not in df.columns:
+            raise ValueError(f"Feature column {c!r} is missing from training frame.")
+        df[c] = pd.to_numeric(df[c], errors="coerce")
+    impute_group_medians(df, feature_cols, group_col)
+    for c in feature_cols:
+        col_med = df[c].median()
+        fill_v = 0.0 if pd.isna(col_med) else float(col_med)
+        df[c] = df[c].fillna(fill_v)
 
 
 def main() -> None:
@@ -1076,7 +1110,12 @@ def main() -> None:
     else:
         feature_cols = list(tournament_features)
 
+    fill_feature_columns_for_regression(train, feature_cols, group_col="season_year")
     train = train.dropna(subset=feature_cols)
+    if len(train) == 0:
+        raise SystemExit(
+            "No training rows after feature assembly and imputation; check merges and filters."
+        )
 
     print(
         "\nFeatures: tournament block + "
