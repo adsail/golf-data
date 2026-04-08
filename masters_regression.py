@@ -27,6 +27,7 @@ Usage:
   python masters_regression.py
   python masters_regression.py --skill-forward-select --entry-alpha 0.05
   python masters_regression.py --include-skill-features
+  python masters_regression.py --output-csv predictions.csv
 """
 
 from __future__ import annotations
@@ -112,6 +113,16 @@ def parse_finish(fin: str | None) -> float | None:
         return None
 
 
+def normalize_dg_id(df: pd.DataFrame, col: str = "dg_id") -> None:
+    """
+    In-place: cast player id to string so merges align across endpoints
+    (JSON often mixes int/str for the same id).
+    """
+    if col not in df.columns or df.empty:
+        return
+    df[col] = df[col].astype(str).str.strip()
+
+
 def fetch_archive_year(fc: FetchConfig, year: int, event_id: int) -> pd.DataFrame:
     js = fc.get(
         "/preds/pre-tournament-archive",
@@ -123,6 +134,7 @@ def fetch_archive_year(fc: FetchConfig, year: int, event_id: int) -> pd.DataFram
         return df
     df["season_year"] = year
     df["finish_rank"] = df["fin_text"].map(parse_finish)
+    normalize_dg_id(df)
     return df
 
 
@@ -243,6 +255,8 @@ def aggregate_event_finishes(dfs: list[pd.DataFrame]) -> pd.DataFrame:
                 "pga6m_made_cut_rate",
             ]
         )
+    for p in parts:
+        normalize_dg_id(p)
     all_rows = pd.concat(parts, ignore_index=True)
     g = all_rows.groupby("dg_id", as_index=False)
     agg = g.agg(
@@ -253,6 +267,7 @@ def aggregate_event_finishes(dfs: list[pd.DataFrame]) -> pd.DataFrame:
         pga6m_made_cut_rate=("made_cut_numeric", "mean"),
     )
     agg["pga6m_top25_rate"] = agg["pga6m_top25_count"] / agg["pga6m_starts"].clip(lower=1)
+    normalize_dg_id(agg)
     return agg
 
 
@@ -295,7 +310,10 @@ def prior_masters_features_decay(
                 "masters_prior_best_recent": best_recent,
             }
         )
-    return pd.DataFrame(rows, columns=cols)
+    out_pm = pd.DataFrame(rows, columns=cols)
+    if not out_pm.empty:
+        normalize_dg_id(out_pm)
+    return out_pm
 
 
 def build_masters_history_long(
@@ -312,8 +330,12 @@ def build_masters_history_long(
         t = df[["dg_id", "fin_text"]].copy()
         t["masters_year"] = year
         t["masters_finish"] = t["fin_text"].map(parse_finish)
+        normalize_dg_id(t)
         frames.append(t[["dg_id", "masters_year", "masters_finish"]])
-    return pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
+    out = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
+    if not out.empty:
+        normalize_dg_id(out)
+    return out
 
 
 def merge_age_at_masters(
@@ -329,10 +351,13 @@ def merge_age_at_masters(
     Current-year projection: set use_direct_age=True so age_at_masters = age.
     """
     out = df.copy()
+    normalize_dg_id(out)
     if "age" not in skill.columns or "dg_id" not in skill.columns:
         out["age_at_masters"] = np.nan
         return out
-    age_sub = skill[["dg_id", "age"]].drop_duplicates(subset=["dg_id"])
+    sk = skill.copy()
+    normalize_dg_id(sk)
+    age_sub = sk[["dg_id", "age"]].drop_duplicates(subset=["dg_id"])
     out = out.merge(age_sub, on="dg_id", how="left")
     age_num = pd.to_numeric(out["age"], errors="coerce")
     if use_direct_age:
@@ -430,25 +455,32 @@ def fetch_skill_tables(fc: FetchConfig) -> tuple[pd.DataFrame, pd.DataFrame, pd.
     sk = fc.get("/preds/skill-ratings", {"display": "value", "file_format": "json"})
     skill = pd.DataFrame(sk["players"])
     skill["sg_t2g"] = skill["sg_ott"] + skill["sg_app"] + skill["sg_arg"]
+    normalize_dg_id(skill)
 
     ap = fc.get("/preds/approach-skill", {"period": "l12", "file_format": "json"})
     approach = pd.DataFrame(ap["data"])
+    normalize_dg_id(approach)
 
     dec = fc.get("/preds/player-decompositions", {"tour": "pga", "file_format": "json"})
     decomp = pd.DataFrame(dec["players"])
+    normalize_dg_id(decomp)
     return skill, approach, decomp
 
 
 def fetch_field(fc: FetchConfig) -> pd.DataFrame:
     fu = fc.get("/field-updates", {"tour": "pga", "file_format": "json"})
     rows = fu.get("field") or fu.get("players") or []
-    return pd.DataFrame(rows)
+    df = pd.DataFrame(rows)
+    normalize_dg_id(df)
+    return df
 
 
 def fetch_live_pre_tournament(fc: FetchConfig) -> pd.DataFrame:
     js = fc.get("/preds/pre-tournament", {"tour": "pga", "file_format": "json"})
     rows = js.get("baseline") or []
-    return pd.DataFrame(rows)
+    df = pd.DataFrame(rows)
+    normalize_dg_id(df)
+    return df
 
 
 def merge_skill_features(
@@ -483,18 +515,37 @@ def merge_skill_features(
     d_cols = ["dg_id", "total_course_history_adjustment", "timing_adjustment"]
     d_sub = decomp[[c for c in d_cols if c in decomp.columns]].copy()
 
-    out = base.merge(skill_sub, on="dg_id", how="left")
+    out = base.copy()
+    normalize_dg_id(out)
+    normalize_dg_id(skill_sub)
+    normalize_dg_id(ap_sub)
+    normalize_dg_id(d_sub)
+
+    out = out.merge(skill_sub, on="dg_id", how="left")
     out = out.merge(ap_sub, on="dg_id", how="left")
     out = out.merge(d_sub, on="dg_id", how="left")
 
     p3_cols = [c for c in ("50_100_fw_sg_per_shot", "100_150_fw_sg_per_shot") if c in out.columns]
     if p3_cols:
-        out["par3_approach_proxy"] = out[p3_cols].mean(axis=1, skipna=True)
+        # Avoid numpy "mean of empty slice" when both buckets are NaN for a row
+        out["par3_approach_proxy"] = out[p3_cols].apply(
+            lambda r: float(r.dropna().mean()) if r.notna().any() else np.nan,
+            axis=1,
+        )
     else:
         out["par3_approach_proxy"] = np.nan
 
+    u150 = (
+        out["under_150_rgh_sg_per_shot"]
+        if "under_150_rgh_sg_per_shot" in out.columns
+        else pd.Series(0.0, index=out.index, dtype=float)
+    )
+    sg_arg_s = (
+        out["sg_arg"] if "sg_arg" in out.columns else pd.Series(0.0, index=out.index, dtype=float)
+    )
     out["short_game_tight_lie_proxy"] = (
-        out["under_150_rgh_sg_per_shot"].fillna(0) + out["sg_arg"].fillna(0)
+        pd.to_numeric(u150, errors="coerce").fillna(0.0)
+        + pd.to_numeric(sg_arg_s, errors="coerce").fillna(0.0)
     )
     if "total_course_history_adjustment" in out.columns:
         out["course_history"] = out["total_course_history_adjustment"].fillna(0.0)
@@ -650,6 +701,12 @@ def forward_select_skills(
 
     Returns: (selected, steps, loyo_failed, present_candidates).
     """
+    if len(df) == 0:
+        print(
+            "  No training rows; skipping forward skill selection.",
+            file=sys.stderr,
+        )
+        return [], [], set(), []
     present = [
         c for c in candidate_order if c in df.columns and df[c].notna().any()
     ]
@@ -886,6 +943,8 @@ def impute_group_medians(df: pd.DataFrame, cols: list[str], group_col: str) -> N
         df[c] = df[c].astype(float)
         df[c] = df.groupby(group_col)[c].transform(lambda s: s.fillna(s.median()))
         df[c] = df[c].fillna(df[c].median())
+        # If the column never matched / never observed, median stays NaN — fill so we do not drop every row
+        df[c] = df[c].fillna(0.0)
 
 
 def fill_feature_columns_for_regression(
@@ -969,6 +1028,13 @@ def main() -> None:
         "--no-skip-predict-below-min-pga6m",
         action="store_true",
         help="Include sub-threshold 6m-start players in the ranked 2026 prediction table",
+    )
+    ap.add_argument(
+        "--output-csv",
+        type=str,
+        default="",
+        metavar="PATH",
+        help="Write the ranked 2026 prediction table (same columns as printed) to this CSV path",
     )
     args = ap.parse_args()
 
@@ -1083,7 +1149,15 @@ def main() -> None:
         for c in skill_cols_avail:
             train[c] = train[c].fillna(train[c].median())
         skill_cols_avail = [c for c in skill_cols_avail if not train[c].isna().all()]
+        _tourney_na = train[tournament_features].isna().sum()
         train = train.dropna(subset=tournament_features)
+        if len(train) == 0:
+            raise SystemExit(
+                "No training rows after dropna(tournament_features). "
+                "Often caused by dg_id type mismatch between archives and skill feeds "
+                "(now normalized to string) or failed form/prior merges.\n"
+                f"NA counts per tournament feature before that drop:\n{_tourney_na.to_string()}"
+            )
         selected_skills, _steps, loyo_failed_set, present_candidates = forward_select_skills(
             train,
             "finish_rank",
@@ -1111,10 +1185,13 @@ def main() -> None:
         feature_cols = list(tournament_features)
 
     fill_feature_columns_for_regression(train, feature_cols, group_col="season_year")
+    _dbg_cols = ["finish_rank"] + [c for c in feature_cols if c in train.columns]
+    _na_before_final = train[_dbg_cols].isna().sum()
     train = train.dropna(subset=feature_cols)
     if len(train) == 0:
         raise SystemExit(
-            "No training rows after feature assembly and imputation; check merges and filters."
+            "No training rows after feature assembly and imputation; check merges and filters.\n"
+            f"NA counts before that dropna:\n{_na_before_final.to_string()}"
         )
 
     print(
@@ -1267,7 +1344,12 @@ def main() -> None:
     pred_df = pred_df.sort_values("pred_finish_rank")
     cols_show = ["player_name", "pred_finish_rank"] + predict_features
     cols_show = [c for c in cols_show if c in pred_df.columns]
-    print(pred_df[cols_show].to_string(index=False))
+    out_tbl = pred_df[cols_show]
+    print(out_tbl.to_string(index=False))
+    if args.output_csv.strip():
+        path = args.output_csv.strip()
+        out_tbl.to_csv(path, index=False)
+        print(f"\nWrote prediction table to {path}")
 
 
 if __name__ == "__main__":
