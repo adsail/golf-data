@@ -6,18 +6,9 @@ Training target (Y): Masters finish from pre-tournament-archive (fin_text).
 
 Features (X) — tournament-based (always in the model):
   - Prior ~6 months of PGA Tour events before each Masters (pre-tournament-archive).
-  - Prior Masters history: decay-weighted mean finish, best in a recent window, starts.
-  - Skill-table age at Masters (back-cast on training rows; direct age for current projection).
+  - Prior Masters history: starts, decay-weighted finish, recent-best finish, prior top-10 count.
+  - Period-accurate SG form from those prior-6-month archives (approach / OTT / putting means).
   - Low 6m PGA sample: pessimistic form constants + pga6m_insufficient flag (see flags).
-
-Optional skill metrics (current API snapshots): merged when using
-  --include-skill-features (fixed bundle) or --skill-forward-select (iterative).
-
---skill-forward-select runs forward selection: each candidate must pass
-  (1) full-sample partial F with p < --entry-alpha, and
-  (2) leave-one-Masters-year-out (LOYO) mean RMSE improvement vs the reduced model.
-Forward selection uses classical OLS for gates; the final reported fit uses
-cluster-robust SE by dg_id when possible. Stepwise search is exploratory.
 
 API key: DATAGOLF_KEY in the environment.
 
@@ -25,8 +16,6 @@ Usage:
   export DATAGOLF_KEY=your_key
   pip install -r requirements.txt
   python masters_regression.py
-  python masters_regression.py --skill-forward-select --entry-alpha 0.05
-  python masters_regression.py --include-skill-features
   python masters_regression.py --output-csv predictions.csv
 """
 
@@ -218,6 +207,42 @@ def pga_events_in_window(
     return out
 
 
+def _pick_archive_stat_col(columns: list[str], aliases: list[str], tokens: list[str]) -> str | None:
+    low_to_orig = {str(c).lower(): str(c) for c in columns}
+    for a in aliases:
+        if a.lower() in low_to_orig:
+            return low_to_orig[a.lower()]
+    hits: list[str] = []
+    for low, orig in low_to_orig.items():
+        if all(t in low for t in tokens):
+            hits.append(orig)
+    if not hits:
+        return None
+    hits.sort(key=len)
+    return hits[0]
+
+
+def archive_sg_column_map(df: pd.DataFrame) -> dict[str, str | None]:
+    cols = [str(c) for c in df.columns]
+    return {
+        "pga6m_sg_app_mean": _pick_archive_stat_col(
+            cols,
+            aliases=["sg_app", "sg:app", "sg_approach", "approach_sg", "app_sg"],
+            tokens=["sg", "app"],
+        ),
+        "pga6m_sg_ott_mean": _pick_archive_stat_col(
+            cols,
+            aliases=["sg_ott", "sg:ott", "sg_off_tee", "off_tee_sg", "ott_sg"],
+            tokens=["sg", "ott"],
+        ),
+        "pga6m_sg_putt_mean": _pick_archive_stat_col(
+            cols,
+            aliases=["sg_putt", "sg:putt", "putting_sg", "putt_sg"],
+            tokens=["sg", "putt"],
+        ),
+    }
+
+
 def aggregate_event_finishes(dfs: list[pd.DataFrame]) -> pd.DataFrame:
     parts = []
     for df in dfs:
@@ -229,7 +254,25 @@ def aggregate_event_finishes(dfs: list[pd.DataFrame]) -> pd.DataFrame:
         t["finish_rank"] = t["fin_text"].map(parse_finish)
         t["made_cut_numeric"] = t["finish_rank"].notna().astype(float)
         t["top25"] = (t["finish_rank"].notna() & (t["finish_rank"] <= 25)).astype(float)
-        parts.append(t[["dg_id", "finish_rank", "made_cut_numeric", "top25"]])
+        sg_map = archive_sg_column_map(df)
+        for feat, src in sg_map.items():
+            if src is None or src not in df.columns:
+                t[feat] = np.nan
+            else:
+                t[feat] = pd.to_numeric(df[src], errors="coerce")
+        parts.append(
+            t[
+                [
+                    "dg_id",
+                    "finish_rank",
+                    "made_cut_numeric",
+                    "top25",
+                    "pga6m_sg_app_mean",
+                    "pga6m_sg_ott_mean",
+                    "pga6m_sg_putt_mean",
+                ]
+            ]
+        )
     if not parts:
         return pd.DataFrame(
             columns=[
@@ -240,6 +283,9 @@ def aggregate_event_finishes(dfs: list[pd.DataFrame]) -> pd.DataFrame:
                 "pga6m_top25_rate",
                 "pga6m_top25_count",
                 "pga6m_made_cut_rate",
+                "pga6m_sg_app_mean",
+                "pga6m_sg_ott_mean",
+                "pga6m_sg_putt_mean",
             ]
         )
     parts = [p for p in parts if not p.empty]
@@ -253,6 +299,9 @@ def aggregate_event_finishes(dfs: list[pd.DataFrame]) -> pd.DataFrame:
                 "pga6m_top25_rate",
                 "pga6m_top25_count",
                 "pga6m_made_cut_rate",
+                "pga6m_sg_app_mean",
+                "pga6m_sg_ott_mean",
+                "pga6m_sg_putt_mean",
             ]
         )
     for p in parts:
@@ -265,6 +314,9 @@ def aggregate_event_finishes(dfs: list[pd.DataFrame]) -> pd.DataFrame:
         pga6m_median_finish=("finish_rank", "median"),
         pga6m_top25_count=("top25", "sum"),
         pga6m_made_cut_rate=("made_cut_numeric", "mean"),
+        pga6m_sg_app_mean=("pga6m_sg_app_mean", "mean"),
+        pga6m_sg_ott_mean=("pga6m_sg_ott_mean", "mean"),
+        pga6m_sg_putt_mean=("pga6m_sg_putt_mean", "mean"),
     )
     agg["pga6m_top25_rate"] = agg["pga6m_top25_count"] / agg["pga6m_starts"].clip(lower=1)
     normalize_dg_id(agg)
@@ -286,6 +338,7 @@ def prior_masters_features_decay(
         "masters_prior_starts",
         "masters_prior_decay_mean_finish",
         "masters_prior_best_recent",
+        "masters_prior_top10_count",
     ]
     prev = mhist[
         (mhist["masters_year"] < target_year) & mhist["masters_finish"].notna()
@@ -308,6 +361,7 @@ def prior_masters_features_decay(
                 "masters_prior_starts": float(len(f)),
                 "masters_prior_decay_mean_finish": decay_mean,
                 "masters_prior_best_recent": best_recent,
+                "masters_prior_top10_count": float(np.sum(f <= 10.0)),
             }
         )
     out_pm = pd.DataFrame(rows, columns=cols)
@@ -979,28 +1033,6 @@ def main() -> None:
         help="Keep only players with at least one top-25 in the prior-6-month PGA window",
     )
     ap.add_argument(
-        "--include-skill-features",
-        action="store_true",
-        help="Append fixed skill bundle (no forward selection)",
-    )
-    ap.add_argument(
-        "--skill-forward-select",
-        action="store_true",
-        help="Iteratively add skill metrics if p < alpha and LOYO RMSE improves",
-    )
-    ap.add_argument(
-        "--entry-alpha",
-        type=float,
-        default=0.05,
-        help="Gate A: maximum p-value for adding a skill candidate (default 0.05)",
-    )
-    ap.add_argument(
-        "--loyo-epsilon",
-        type=float,
-        default=0.0,
-        help="Gate B: admit if mean LOYO RMSE(full) <= mean LOYO RMSE(reduced) - epsilon",
-    )
-    ap.add_argument(
         "--masters-decay-lambda",
         type=float,
         default=0.25,
@@ -1019,12 +1051,6 @@ def main() -> None:
         help="Below this many PGA starts in the 6m window, form metrics are pessimistic + flag",
     )
     ap.add_argument(
-        "--pga-ref-year",
-        type=int,
-        default=2026,
-        help="Reference year for back-casting skill-table age on training rows (age_at_Masters)",
-    )
-    ap.add_argument(
         "--no-skip-predict-below-min-pga6m",
         action="store_true",
         help="Include sub-threshold 6m-start players in the ranked 2026 prediction table",
@@ -1037,13 +1063,6 @@ def main() -> None:
         help="Write the ranked 2026 prediction table (same columns as printed) to this CSV path",
     )
     args = ap.parse_args()
-
-    if args.include_skill_features and args.skill_forward_select:
-        print(
-            "Both --include-skill-features and --skill-forward-select set; "
-            "using forward selection only.",
-            file=sys.stderr,
-        )
 
     key = os.environ.get("DATAGOLF_KEY", "").strip()
     if not key:
@@ -1085,6 +1104,13 @@ def main() -> None:
         fdf = form_features_for_year(event_list, masters_meta, cy, archive_cache)
         if fdf.empty:
             continue
+        cover_msg = (
+            f"  Coverage {cy}: n={len(fdf)} "
+            f"sg_app={int(fdf['pga6m_sg_app_mean'].notna().sum())} "
+            f"sg_ott={int(fdf['pga6m_sg_ott_mean'].notna().sum())} "
+            f"sg_putt={int(fdf['pga6m_sg_putt_mean'].notna().sum())}"
+        )
+        print(cover_msg)
         fdf["season_year"] = cy
         form_parts.append(fdf)
 
@@ -1103,14 +1129,11 @@ def main() -> None:
     train = train.merge(form_all, on=["dg_id", "season_year"], how="left")
     train = train.merge(prior_all, on=["dg_id", "season_year"], how="left")
 
-    print("Fetching skill / approach / decomp tables (age + optional skill merge)…")
-    skill_tbl, approach_tbl, decomp_tbl = fetch_skill_tables(fc)
-    train = merge_age_at_masters(train, skill_tbl, args.pga_ref_year)
-
     prior_cols = [
         "masters_prior_starts",
         "masters_prior_decay_mean_finish",
         "masters_prior_best_recent",
+        "masters_prior_top10_count",
     ]
     impute_group_medians(train, prior_cols, "season_year")
 
@@ -1119,70 +1142,19 @@ def main() -> None:
         "pga6m_mean_finish",
         "pga6m_top25_rate",
         "pga6m_made_cut_rate",
+        "pga6m_sg_app_mean",
+        "pga6m_sg_ott_mean",
+        "pga6m_sg_putt_mean",
     ]
     impute_group_medians(train, form_cols, "season_year")
     apply_pga6m_insufficient_form(train, args.min_pga6m_starts)
-    impute_group_medians(train, ["age_at_masters"], "season_year")
 
     if args.require_top25_in_6m:
         train = train[train["pga6m_top25_count"] >= 1].copy()
         print(f"\nAfter --require-top25-in-6m: {len(train)} rows")
 
-    tournament_features = prior_cols + form_cols + ["pga6m_insufficient", "age_at_masters"]
-
-    skill_bundle = [
-        "sg_t2g",
-        "sg_app",
-        "par5_long_approach_proxy",
-        "course_history",
-        "short_game_tight_lie_proxy",
-        "length_proxy",
-    ]
-
-    selected_skills: list[str] = []
-    if args.skill_forward_select:
-        train = merge_skill_features(train, skill_tbl, approach_tbl, decomp_tbl)
-        skill_cols_avail = [c for c in SKILL_CANDIDATE_ORDER if c in train.columns]
-        for c in skill_cols_avail:
-            train[c] = pd.to_numeric(train[c], errors="coerce")
-        impute_group_medians(train, skill_cols_avail, "season_year")
-        for c in skill_cols_avail:
-            train[c] = train[c].fillna(train[c].median())
-        skill_cols_avail = [c for c in skill_cols_avail if not train[c].isna().all()]
-        _tourney_na = train[tournament_features].isna().sum()
-        train = train.dropna(subset=tournament_features)
-        if len(train) == 0:
-            raise SystemExit(
-                "No training rows after dropna(tournament_features). "
-                "Often caused by dg_id type mismatch between archives and skill feeds "
-                "(now normalized to string) or failed form/prior merges.\n"
-                f"NA counts per tournament feature before that drop:\n{_tourney_na.to_string()}"
-            )
-        selected_skills, _steps, loyo_failed_set, present_candidates = forward_select_skills(
-            train,
-            "finish_rank",
-            tournament_features,
-            SKILL_CANDIDATE_ORDER,
-            alpha=args.entry_alpha,
-            loyo_epsilon=args.loyo_epsilon,
-            group_col="season_year",
-        )
-        feature_cols = tournament_features + selected_skills
-        print_skill_selection_summary(
-            train,
-            "finish_rank",
-            SKILL_CANDIDATE_ORDER,
-            present_candidates,
-            selected_skills,
-            loyo_failed_set,
-            tournament_features,
-            args.entry_alpha,
-        )
-    elif args.include_skill_features:
-        train = merge_skill_features(train, skill_tbl, approach_tbl, decomp_tbl)
-        feature_cols = tournament_features + skill_bundle
-    else:
-        feature_cols = list(tournament_features)
+    tournament_features = prior_cols + form_cols + ["pga6m_insufficient"]
+    feature_cols = list(tournament_features)
 
     fill_feature_columns_for_regression(train, feature_cols, group_col="season_year")
     _dbg_cols = ["finish_rank"] + [c for c in feature_cols if c in train.columns]
@@ -1196,7 +1168,7 @@ def main() -> None:
 
     print(
         "\nFeatures: tournament block + "
-        f"{'forward-selected skills' if args.skill_forward_select else 'optional skill bundle' if args.include_skill_features else 'skills off'}."
+        "archive-period form only (no snapshot skill endpoints)."
     )
 
     res_full, _ = run_model_iteration(
@@ -1212,12 +1184,7 @@ def main() -> None:
         "pga_last_6m": [
             c for c in form_cols + ["pga6m_insufficient"] if c in feature_cols
         ],
-        "age": [c for c in ["age_at_masters"] if c in feature_cols],
     }
-    if selected_skills:
-        blocks["skill_selected"] = selected_skills
-    elif args.include_skill_features and not args.skill_forward_select:
-        blocks["skill_extra"] = [c for c in skill_bundle if c in feature_cols]
 
     print(
         "\n=== Partial F-tests (nested OLS; classical F, not cluster-robust) ===\n"
@@ -1234,12 +1201,7 @@ def main() -> None:
         print(f"  drop {name} ({cols}): F={f_s:.3f}, df_num={q}, p={p_v:.4g}")
 
     insignificant = [b for b in block_results if b[2] > 0.05]
-    if (
-        not args.skill_forward_select
-        and not args.include_skill_features
-        and len(insignificant) == len(block_results)
-        and len(block_results) > 0
-    ):
+    if len(insignificant) == len(block_results) and len(block_results) > 0:
         print(
             "\nAll tested tournament blocks insignificant at α=0.05 — refitting without "
             "`pga6m_mean_finish`."
@@ -1277,7 +1239,6 @@ def main() -> None:
     merged = field.merge(live[["dg_id", "top_20", "win"]], on="dg_id", how="inner")
     merged = merged.merge(form26, on="dg_id", how="left")
     merged = merged.merge(prior26, on="dg_id", how="left")
-    merged = merge_age_at_masters(merged, skill_tbl, args.pga_ref_year, use_direct_age=True)
 
     for c in prior_cols:
         if c in merged.columns:
@@ -1299,26 +1260,8 @@ def main() -> None:
             merged.loc[suff_mask, c] = merged.loc[suff_mask, c].fillna(med_form.get(c, np.nan))
     apply_pga6m_insufficient_form(merged, args.min_pga6m_starts)
 
-    age_med_tr = train["age_at_masters"].median()
-    merged["age_at_masters"] = pd.to_numeric(merged["age_at_masters"], errors="coerce").fillna(
-        age_med_tr
-    )
-
     if args.require_top25_in_6m:
         merged = merged[merged["pga6m_top25_count"] >= 1].copy()
-
-    if args.skill_forward_select or args.include_skill_features:
-        merged = merge_skill_features(merged, skill_tbl, approach_tbl, decomp_tbl)
-        if args.skill_forward_select:
-            for c in predict_features:
-                if c not in tournament_features and c in merged.columns:
-                    merged[c] = pd.to_numeric(merged[c], errors="coerce")
-            # Impute skill columns for prediction rows
-            skill_only_pred = [c for c in predict_features if c not in tournament_features]
-            if skill_only_pred:
-                merged[skill_only_pred] = merged[skill_only_pred].fillna(
-                    merged[skill_only_pred].median()
-                )
 
     if not args.no_skip_predict_below_min_pga6m:
         starts_pred = pd.to_numeric(merged["pga6m_starts"], errors="coerce").fillna(0.0)
@@ -1336,6 +1279,16 @@ def main() -> None:
             )
             print(f"  {head}{tail}")
         merged = merged.loc[~low_starts].copy()
+
+    # Final prediction-time guardrail: ensure all model features are filled so
+    # ranked output is not emptied by listwise dropna when a feed column is sparse.
+    for c in predict_features:
+        if c not in merged.columns:
+            merged[c] = np.nan
+        merged[c] = pd.to_numeric(merged[c], errors="coerce")
+        tr_med = pd.to_numeric(train[c], errors="coerce").median() if c in train.columns else np.nan
+        fill_v = 0.0 if pd.isna(tr_med) else float(tr_med)
+        merged[c] = merged[c].fillna(fill_v)
 
     pred_df = merged.dropna(subset=predict_features).copy()
     Xp = sm.add_constant(pred_df[predict_features], has_constant="add")
